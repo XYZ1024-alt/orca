@@ -11,18 +11,24 @@ import WorkspaceKanbanDrawer from './WorkspaceKanbanDrawer'
 import type { VirtualizedScrollAnchor } from '@/hooks/useVirtualizedScrollAnchor'
 import { cn } from '@/lib/utils'
 import { FolderPlus, Loader2 } from 'lucide-react'
+import { ActivityThreadCollapseContext } from '@/components/activity/activity-thread-collapse-context'
 import { useSidebarProjectDrop } from './useSidebarProjectDrop'
 import { useWorkspaceBoardPanel } from './useWorkspaceBoardPanel'
-import { createSingleFlightCoalescer, type SingleFlightCoalescer } from './single-flight-coalescer'
+import { useWorkspaceRevealBodyRedirect } from './use-workspace-reveal-body-redirect'
 import { resolveLeftSidebarStyleVariables } from '@/lib/left-sidebar-appearance'
 import { useSystemPrefersDark } from '@/components/terminal-pane/use-system-prefers-dark'
 import { lazyWithRetry } from '@/lib/lazy-with-retry'
+
+// Why lazy: the Agents list pulls the whole activity pipeline (virtualizer, markdown
+// previews, thread derivation); users on the workspace view should not load or render any of it.
+const SidebarAgentsList = lazyWithRetry(() => import('./SidebarAgentsList'))
 
 const WorktreeMetaDialog = lazyWithRetry(() => import('./WorktreeMetaDialog'))
 const RemoveFolderDialog = lazyWithRetry(() => import('./RemoveFolderDialog'))
 const WorktreeVisibilityDialog = lazyWithRetry(() => import('./WorktreeVisibilityDialog'))
 const OrcaYamlTrustDialog = lazyWithRetry(() => import('./OrcaYamlTrustDialog'))
 const ForgetSshWorkspaceDialog = lazyWithRetry(() => import('./ForgetSshWorkspaceDialog'))
+const AgentDashboardSidebarHost = lazyWithRetry(() => import('./AgentDashboardSidebarHost'))
 
 const MIN_WIDTH = 220
 const MAX_WIDTH = 500
@@ -48,6 +54,38 @@ function Sidebar({
   const repos = useAppStore((s) => s.repos)
   const startupWorktreeRefreshCompleted = useAppStore((s) => s.startupWorktreeRefreshCompleted)
   const settings = useAppStore((s) => s.settings)
+  const sidebarBody = useAppStore((s) => s.sidebarBody ?? 'workspaces')
+  const showAgentDashboard = settings?.experimentalAgentDashboardPopout === true
+  const agentDashboardDrawerOpen = useAppStore((s) => s.agentDashboardDrawerOpen)
+  const setAgentDashboardDrawerOpen = useAppStore((s) => s.setAgentDashboardDrawerOpen)
+  const agentReadFilter = useAppStore((s) => s.agentsReadFilter)
+  const setAgentReadFilter = useAppStore((s) => s.setAgentsReadFilter)
+  const agentGroupBy = useAppStore((s) => s.agentsGroupBy)
+  const setAgentGroupBy = useAppStore((s) => s.setAgentsGroupBy)
+  const [agentQuery, setAgentQuery] = React.useState('')
+  const [agentOptionsTarget, setAgentOptionsTarget] = React.useState<HTMLDivElement | null>(null)
+  const agentsScrollTopRef = React.useRef(0)
+  // Held here so collapsed groups (and the layout the saved scrollTop assumes)
+  // survive the Agents list unmounting on sidebar body switches.
+  const [agentsCollapsedGroupKeys, setAgentsCollapsedGroupKeys] = React.useState<
+    ReadonlySet<string>
+  >(() => new Set())
+  const agentsCollapseState = useMemo(
+    () => ({
+      collapsedGroupKeys: agentsCollapsedGroupKeys,
+      onToggleGroupCollapse: (groupKey: string) =>
+        setAgentsCollapsedGroupKeys((prev) => {
+          const next = new Set(prev)
+          if (next.has(groupKey)) {
+            next.delete(groupKey)
+          } else {
+            next.add(groupKey)
+          }
+          return next
+        })
+    }),
+    [agentsCollapsedGroupKeys]
+  )
   const fetchAllWorktrees = useAppStore((s) => s.fetchAllWorktrees)
   const activeModal = useAppStore((s) => s.activeModal)
   const statusBarVisible = useAppStore((s) => s.statusBarVisible)
@@ -86,50 +124,17 @@ function Sidebar({
     }
   }, [repoCount, startupWorktreeRefreshCompleted, fetchAllWorktrees])
 
-  // Why: a runtime host coming online/offline must refresh the sidebar so its
-  // worktrees appear/drop, the same way SSH state changes already refetch. Only
-  // the manual connect button refetched before, so the list went stale until the
-  // user forced a refetch (e.g. via Add Project). React to the set of online
-  // runtime envs (a host has a status entry once it is connected).
-  const runtimeStatusByEnvironmentId = useAppStore((s) => s.runtimeStatusByEnvironmentId)
-  const fetchWorktreeLineage = useAppStore((s) => s.fetchWorktreeLineage)
-  const onlineRuntimeEnvKey = React.useMemo(
-    () =>
-      // Why: tolerate an absent map — a partial/hydrating store can leave this
-      // undefined, and a thrown selector would crash the whole sidebar render.
-      [...(runtimeStatusByEnvironmentId?.entries() ?? [])]
-        .filter(([, entry]) => Boolean(entry?.status))
-        .map(([id]) => id)
-        .sort()
-        .join(','),
-    [runtimeStatusByEnvironmentId]
-  )
-  const previousOnlineRuntimeEnvKeyRef = React.useRef<string | null>(null)
-  // Coalesce staggered wake reconnects so K hosts can't fire K sidebar remounts and freeze (#8539).
-  const reconnectRefreshRef = React.useRef<SingleFlightCoalescer | null>(null)
-  if (reconnectRefreshRef.current === null) {
-    reconnectRefreshRef.current = createSingleFlightCoalescer(() =>
-      fetchAllWorktrees().then(() => fetchWorktreeLineage())
-    )
-  }
-  useEffect(() => {
-    const previousOnlineRuntimeEnvKey = previousOnlineRuntimeEnvKeyRef.current
-    previousOnlineRuntimeEnvKeyRef.current = onlineRuntimeEnvKey
-    if (
-      previousOnlineRuntimeEnvKey === null ||
-      previousOnlineRuntimeEnvKey === onlineRuntimeEnvKey ||
-      !startupWorktreeRefreshCompleted
-    ) {
-      return
-    }
-    reconnectRefreshRef.current?.request()
-  }, [onlineRuntimeEnvKey, startupWorktreeRefreshCompleted])
-
   useEffect(() => {
     if (!sidebarOpen && workspaceBoardRenderedOpen) {
       closeWorkspaceBoard()
     }
   }, [closeWorkspaceBoard, sidebarOpen, workspaceBoardRenderedOpen])
+
+  useEffect(() => {
+    if (!showAgentDashboard && agentDashboardDrawerOpen) {
+      setAgentDashboardDrawerOpen(false)
+    }
+  }, [agentDashboardDrawerOpen, setAgentDashboardDrawerOpen, showAgentDashboard])
 
   const { containerRef, onResizeStart, isResizing } = useSidebarResize<HTMLDivElement>({
     isOpen: sidebarOpen,
@@ -140,6 +145,8 @@ function Sidebar({
     setWidth: setSidebarWidth,
     onDraftWidthChange: setLiveSidebarWidth
   })
+
+  useWorkspaceRevealBodyRedirect(sidebarOpen && sidebarBody === 'agents')
 
   return (
     <TooltipProvider delayDuration={400}>
@@ -154,25 +161,46 @@ function Sidebar({
           <>
             {/* Fixed controls */}
             <SidebarNav />
-            <SidebarHeader onWorkspaceBoardMenuOpenChange={setWorkspaceBoardMenuOpen} />
-
-            <WorktreeList
-              scrollOffsetRef={worktreeScrollOffsetRef}
-              scrollAnchorRef={worktreeScrollAnchorRef}
-              workspaceBoardOpen={workspaceBoardOpen}
-              onWorkspaceBoardDragPreviewStart={previewWorkspaceBoardFromDrag}
-              onWorkspaceBoardDragPreviewCommit={solidifyWorkspaceBoardFromDrag}
-              onWorkspaceBoardDragPreviewCancel={cancelWorkspaceBoardDragPreview}
+            <SidebarHeader
+              onWorkspaceBoardMenuOpenChange={setWorkspaceBoardMenuOpen}
+              activityOptionsTarget={setAgentOptionsTarget}
             />
+            {sidebarBody === 'agents' ? (
+              <React.Suspense fallback={<div className="min-h-0 flex-1" />}>
+                <ActivityThreadCollapseContext.Provider value={agentsCollapseState}>
+                  <SidebarAgentsList
+                    readFilter={agentReadFilter}
+                    setReadFilter={setAgentReadFilter}
+                    groupBy={agentGroupBy}
+                    setGroupBy={setAgentGroupBy}
+                    query={agentQuery}
+                    setQuery={setAgentQuery}
+                    optionsTarget={agentOptionsTarget}
+                    scrollTopRef={agentsScrollTopRef}
+                  />
+                </ActivityThreadCollapseContext.Provider>
+              </React.Suspense>
+            ) : (
+              <WorktreeList
+                scrollOffsetRef={worktreeScrollOffsetRef}
+                scrollAnchorRef={worktreeScrollAnchorRef}
+                workspaceBoardOpen={workspaceBoardOpen}
+                onWorkspaceBoardDragPreviewStart={previewWorkspaceBoardFromDrag}
+                onWorkspaceBoardDragPreviewCommit={solidifyWorkspaceBoardFromDrag}
+                onWorkspaceBoardDragPreviewCancel={cancelWorkspaceBoardDragPreview}
+              />
+            )}
 
-            <SetupScriptPromptCard />
+            <div className="relative shrink-0">
+              <SetupScriptPromptCard />
 
-            {/* Fixed bottom toolbar */}
-            <SidebarToolbar
-              workspaceBoardOpen={workspaceBoardOpen}
-              workspaceBoardDragPreviewOpen={workspaceBoardDragPreviewOpen}
-              onWorkspaceBoardToggle={toggleWorkspaceBoard}
-            />
+              {/* Fixed bottom toolbar */}
+              <SidebarToolbar
+                workspaceBoardOpen={workspaceBoardOpen}
+                workspaceBoardDragPreviewOpen={workspaceBoardDragPreviewOpen}
+                onWorkspaceBoardToggle={toggleWorkspaceBoard}
+              />
+            </div>
           </>
         )}
 
@@ -231,6 +259,17 @@ function Sidebar({
           onOpenChange={handleWorkspaceBoardOpenChange}
           onMenuOpenChange={setWorkspaceBoardMenuOpen}
         />
+      ) : null}
+      {showAgentDashboard ? (
+        <React.Suspense fallback={null}>
+          <AgentDashboardSidebarHost
+            sidebarOpen={sidebarOpen}
+            workspaceBoardOpen={workspaceBoardOpen}
+            closeWorkspaceBoard={closeWorkspaceBoard}
+            leftSidebarStyle={leftSidebarStyle}
+            statusBarVisible={statusBarVisible}
+          />
+        </React.Suspense>
       ) : null}
     </TooltipProvider>
   )

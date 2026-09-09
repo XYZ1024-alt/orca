@@ -1,6 +1,7 @@
 import type { RpcClient } from '../transport/rpc-client'
 import type { ConnectionState } from '../transport/types'
 import type { MobileImageSource } from './mobile-image-source-picker'
+import type { MobileNativeChatSendOutcome } from './mobile-native-chat-send'
 import { useMobileImageAttachment } from './use-mobile-image-attachment'
 import {
   useMobileNativeChatImageAttachments,
@@ -22,8 +23,27 @@ type Args = {
   readonly nativeChatInputLeaseReady: boolean
   readonly getActiveWorktreeConnectionId: () => Promise<string | null>
   readonly beforeTerminalSend: (terminal: string) => Promise<boolean>
-  readonly nativeChatBaseSend: (text: string, images?: string[]) => Promise<boolean>
+  /** Outcome-preserving so an ambiguous ('unknown') delivery after an image
+   *  paste can mark the terminal input for healing (#10228). Takes the image
+   *  send's budget so the paste and this text body share one `sending` window. */
+  readonly nativeChatBaseSend: (
+    text: string,
+    images?: string[],
+    deadline?: number,
+    attachments?: readonly {
+      id: string
+      path: string
+      previewUri: string
+    }[]
+  ) => Promise<MobileNativeChatSendOutcome>
+  /** Structured agent sessions do not have a terminal paste path. */
+  readonly structuredNativeChat: boolean
+  /** Launch-context text parked on the agent's TUI input line, or null — sizes
+   *  the image paste's leading clear so a multi-line draft cannot ride along. */
+  readonly readSeededLaunchDraft: () => string | null
   readonly showToast: (message: string, durationMs?: number) => void
+  /** Native-chat send failures — rendered in the composer's inline banner. */
+  readonly onNativeChatSendError: (message: string) => void
   readonly onSuccess: () => void
   readonly onError: () => void
 }
@@ -44,7 +64,10 @@ export function useMobileSessionImageAttachments({
   getActiveWorktreeConnectionId,
   beforeTerminalSend,
   nativeChatBaseSend,
+  structuredNativeChat,
+  readSeededLaunchDraft,
   showToast,
+  onNativeChatSendError,
   onSuccess,
   onError
 }: Args): {
@@ -71,9 +94,12 @@ export function useMobileSessionImageAttachments({
     getActiveWorktreeConnectionId,
     connState,
     scopeKey: nativeChatScopeKey,
-    enabled: nativeChatInputLeaseReady,
+    enabled: structuredNativeChat ? connState === 'connected' : nativeChatInputLeaseReady,
+    structuredNativeChat,
     showToast,
+    onSendError: onNativeChatSendError,
     baseSend: nativeChatBaseSend,
+    readSeededLaunchDraft,
     onAttachSuccess: onSuccess,
     onError
   })
